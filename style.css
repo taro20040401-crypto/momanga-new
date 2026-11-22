@@ -454,10 +454,12 @@ body {
   -webkit-overflow-scrolling: touch;
 }
 .modal-pages img {
-  max-width: 100%;
+  width: 100%;
+  max-width: 900px;
   display: block;
   background: var(--bg-soft);
   min-height: 100px;
+  margin: 0 auto;
 }
 .modal-pages img.img-failed {
   background: var(--bg-soft);
@@ -586,6 +588,12 @@ body {
   }
   .modal-meta { font-size: 10px; }
   .modal-nav { bottom: 8px; }
+  /* モバイル: 画像を画面幅いっぱいに広げる */
+  .modal-pages { padding: 8px 0 80px; }
+  .modal-pages img {
+    width: 100%;
+    max-width: 100%;
+  }
 }
 
 @media (max-width: 480px) {

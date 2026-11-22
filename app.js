@@ -553,19 +553,29 @@
   prevBtn.addEventListener("click", function () { scrollToPage(currentPage - 1); });
   nextBtn.addEventListener("click", function () { scrollToPage(currentPage + 1); });
 
-  // スクロール位置でページ番号更新
+  // スクロール位置でページ番号更新(各画像の表示位置から正確に判定)
   modalPages.addEventListener("scroll", function () {
     if (!currentGallery) return;
     var imgs = modalPages.querySelectorAll("img");
+    if (!imgs.length) return;
     var scrollTop = modalPages.scrollTop;
-    var pageH = modalPages.clientHeight;
-    var n = Math.floor(scrollTop / (pageH * 0.9)) + 1;
+    var viewportH = modalPages.clientHeight;
+    // ビューポート中央に最も近い画像を現在ページとする
+    var center = scrollTop + viewportH / 2;
+    var n = 1;
+    for (var i = 0; i < imgs.length; i++) {
+      var top = imgs[i].offsetTop;
+      var h = imgs[i].offsetHeight || 100;
+      if (top + h < center) continue;
+      n = i + 1;
+      break;
+    }
     var total = (currentGallery.images || []).length;
     if (n < 1) n = 1;
     if (n > total) n = total;
     currentPage = n;
     pageIndicator.textContent = n + " / " + total;
-  });
+  }, { passive: true });
 
   // トップへ
   window.addEventListener("scroll", function () {
