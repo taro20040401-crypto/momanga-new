@@ -410,8 +410,36 @@
       var url = "/img/" + src + "/" + gid + "?page=" + page;
       var img = document.createElement("img");
       img.dataset.src = url;
+      img.dataset.page = page;
+      img.dataset.retry = "0";
       img.alt = "page " + page;
       img.referrerpolicy = "no-referrer";
+      img.loading = "lazy";
+      // 読み込み失敗時のリトライ
+      img.addEventListener("error", function () {
+        var retry = parseInt(img.dataset.retry || "0", 10);
+        if (retry < 3) {
+          img.dataset.retry = String(retry + 1);
+          // キャッシュ回避のためにタイムスタンプ付与
+          var sep = url.indexOf("?") >= 0 ? "&" : "?";
+          img.src = url + sep + "retry=" + (retry + 1) + "&t=" + Date.now();
+        } else {
+          // 最終的に失敗したら再読み込みボタン表示
+          img.alt = "page " + page + " (読み込み失敗)";
+          img.classList.add("img-failed");
+          var wrap = document.createElement("div");
+          wrap.className = "img-error-wrap";
+          wrap.innerHTML = '<button class="img-retry-btn" type="button">再読み込み</button>';
+          wrap.querySelector("button").addEventListener("click", function () {
+            img.dataset.retry = "0";
+            img.classList.remove("img-failed");
+            var sep = url.indexOf("?") >= 0 ? "&" : "?";
+            img.src = url + sep + "t=" + Date.now();
+            wrap.remove();
+          });
+          img.parentNode.insertBefore(wrap, img.nextSibling);
+        }
+      });
       modalPages.appendChild(img);
     });
     pageIndicator.textContent = "1 / " + images.length;
@@ -435,7 +463,7 @@
           }
         }
       });
-    }, { rootMargin: "300px" });
+    }, { rootMargin: "500px" });  // 余裕を持って先読み
     $$("img[data-src]").forEach(function (img) { io.observe(img); });
   }
 

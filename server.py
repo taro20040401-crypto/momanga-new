@@ -131,17 +131,57 @@ def unified_search(query: str, source: str = "all", language: str = "all", page:
 
 
 # ===== 画像プロキシ =====
+def _fetch_url(url: str, headers: dict, timeout: int = 30, retries: int = 2) -> bytes:
+    """URL を取得。リトライ付き。"""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
+                return r.read()
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(0.3 * (attempt + 1))
+    raise last_exc
+
+
+def _fetch_hitomi_image_with_fallback(file_hash: str) -> bytes:
+    """hash から両シャードを試して取得。gg.js キャッシュが古い場合のフォールバック付き。"""
+    urls = provider_hitomi._hash_to_paths(file_hash)
+    headers = {"User-Agent": UA, "Accept-Encoding": "identity",
+               "Referer": "https://hitomi.la/"}
+    # まず計算されたシャードで取得
+    primary = urls.get("webp")
+    if primary:
+        try:
+            return _fetch_url(primary, headers, timeout=30, retries=1)
+        except Exception as e:
+            if DEBUG: print(f"[hitomi img] primary failed: {primary[:80]} err={e}")
+    # フォールバック: 逆シャードを試す
+    g = int(file_hash[-1] + file_hash[-3:-1], 16)
+    cur_shard = 1 if g in provider_hitomi._gg_cache["shards"] else 0
+    alt_shard = 0 if cur_shard == 1 else 1
+    base = provider_hitomi._gg_cache["b"]
+    dir_num = int(file_hash[-1] + file_hash[-3:-1], 16)
+    alt_url = f"https://w{1+alt_shard}.{provider_hitomi.IMG_CDN}/{base}{dir_num}/{file_hash}.webp"
+    if DEBUG: print(f"[hitomi img] trying alt: {alt_url[:80]}")
+    return _fetch_url(alt_url, headers, timeout=30, retries=2)
+
+
 def fetch_image(source: str, gallery_id: str, page: int) -> tuple:
     """画像を取得して (bytes, content_type) を返す。"""
     if source == "momonga":
-        # momonga は thumbnails と詳細画像で同じホスト
-        # 詳細画像: https://zN.momon-ga.me/galleries/<id>/<page>.webp
-        # サムネも同じ形式で page=1
-        url = f"https://z2.momon-ga.me/galleries/{gallery_id}/{page}.webp"
-        headers = {"User-Agent": UA, "Accept-Encoding": "identity"}
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30, context=SSL_CTX) as r:
-            return r.read(), "image/webp"
+        # momonga: z2 がダメなら z3 を試す
+        for host in ("z2", "z3"):
+            url = f"https://{host}.momon-ga.me/galleries/{gallery_id}/{page}.webp"
+            headers = {"User-Agent": UA, "Accept-Encoding": "identity"}
+            try:
+                return _fetch_url(url, headers, timeout=30, retries=1), "image/webp"
+            except Exception as e:
+                if DEBUG: print(f"[momonga img] {host} failed: {e}")
+                continue
+        raise ValueError(f"momonga image {gallery_id}/{page} not found")
     elif source == "hitomi":
         # galleryinfo を取得 → files[page-1].hash → webp URL
         info = provider_hitomi.get_gallery(gallery_id)
@@ -150,13 +190,16 @@ def fetch_image(source: str, gallery_id: str, page: int) -> tuple:
         # page は1-indexed
         if page < 1 or page > len(info["images"]):
             raise ValueError(f"page {page} が範囲外 (max={len(info['images'])})")
-        url = info["images"][page - 1]
-        # Referer 必須
-        headers = {"User-Agent": UA, "Accept-Encoding": "identity",
-                   "Referer": "https://hitomi.la/"}
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30, context=SSL_CTX) as r:
-            return r.read(), "image/webp"
+        # 画像URLは計算済みだが、hash から再取得(フォールバック用)
+        raw_info = provider_hitomi._fetch_galleryinfo(int(gallery_id))
+        files = (raw_info or {}).get("files") or []
+        if page - 1 >= len(files):
+            raise ValueError(f"page {page} hash not found")
+        file_hash = files[page - 1].get("hash", "")
+        if not file_hash:
+            raise ValueError(f"page {page} hash empty")
+        data = _fetch_hitomi_image_with_fallback(file_hash)
+        return data, "image/webp"
     raise ValueError(f"unknown source: {source}")
 
 
