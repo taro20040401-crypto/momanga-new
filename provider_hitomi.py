@@ -153,6 +153,7 @@ def search(query: str, page: int = 1, language: str = "all") -> dict:
       - それ以外 → nozomiから新着N件取得→各galleryinfo取得→タイトル部分一致でフィルタ
     """
     q = query.strip()
+    is_freetext = bool(q) and not (q.startswith("tag:") or q.startswith("artist:"))
     # 言語別 nozomi:
     #   all → index-all.nozomi
     #   japanese → index-japanese.nozomi
@@ -174,14 +175,25 @@ def search(query: str, page: int = 1, language: str = "all") -> dict:
         # フリーテキスト検索 → 新着から取得してフィルタ
         nozomi_path = f"index-{lang_suffix}.nozomi"
 
-    # 1ページ25件取得
-    ids = _fetch_nozomi(nozomi_path, page=page, per_page=25)
+    # 1ページ25件取得(フリーテキストの場合は多めに取得してフィルタ)
+    # フリーテキストは新着100件から部分一致。1ページ25件だとヒット率低いので4ページ(100件)取得。
+    # ただし2ページ目以降の場合は通常取得
+    fetch_pages = 4 if (is_freetext and page == 1) else 1
+    ids = []
+    for p in range(1, fetch_pages + 1):
+        # フリーテキスト時は常に最新(1ページ目)から取得してフィルタ
+        ids_page = _fetch_nozomi(nozomi_path, page=p if is_freetext else page, per_page=25)
+        if not ids_page:
+            break
+        ids.extend(ids_page)
+        if len(ids_page) < 25:
+            break
     if not ids:
         return {"cards": [], "page": page, "total_pages": page}
+    # フリーテキスト時は page=1 に固定(全部取得済み)
 
     # galleryinfo を並行取得(最大10並列)
     import concurrent.futures
-    is_freetext = bool(q) and not (q.startswith("tag:") or q.startswith("artist:"))
     q_lower = q.lower()
     cards = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
@@ -195,39 +207,84 @@ def search(query: str, page: int = 1, language: str = "all") -> dict:
             if not info:
                 continue
             title = info.get("japanese_title") or info.get("title") or ""
-            lang = info.get("language", "unknown")
+            lang = info.get("language") or "unknown"
             # フリーテキストフィルタ
             if is_freetext and q_lower not in title.lower():
+                tags_raw = info.get("tags") or []
                 tags = [t.get("tag", "") if isinstance(t, dict) else str(t)
-                        for t in info.get("tags", [])]
+                        for t in tags_raw]
                 if not any(q_lower in t.lower() for t in tags):
                     continue
             # サムネ取得 (1枚目のfile hash)
-            files = info.get("files", [])
+            files = info.get("files") or []
             thumb = ""
-            if files:
-                first = files[0]
-                h = first.get("hash", "")
+            if files and isinstance(files[0], dict):
+                h = files[0].get("hash", "")
                 if h:
                     thumb = _hash_to_paths(h).get("thumb", "")
+            gtype = info.get("type") or "doujinshi"
+            tags_raw = info.get("tags") or []
             cards.append({
                 "source": "hitomi",
                 "id": str(gid),
-                "type": info.get("type", "doujinshi"),
+                "type": gtype,
                 "title": title or f"#{gid}",
                 "thumbnail": thumb,
-                "url": f"https://hitomi.la/{info.get('type','doujinshi')}/{_slugify(title)}-{lang}-{gid}.html",
+                "url": f"https://hitomi.la/{gtype}/{_slugify(title)}-{lang}-{gid}.html",
                 "date": info.get("date", ""),
                 "language": lang,
                 "language_local": LANG_LOCAL.get(lang, lang),
                 "tags": [t.get("tag","") if isinstance(t, dict) else str(t)
-                         for t in info.get("tags", [])][:10],
+                         for t in tags_raw][:10],
             })
 
     # nozomi の順序を保つ
     id_order = {gid: i for i, gid in enumerate(ids)}
     cards.sort(key=lambda c: id_order.get(int(c["id"]), 9999))
     total_pages = page + 1 if len(ids) >= 25 else page
+    # フリーテキスト検索で0件の場合は新着をそのまま返す(UX配慮)
+    if is_freetext and not cards and page == 1:
+        # フィルタを外して新着そのまま返す
+        cards_all = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex2:
+            future_to_id = {ex2.submit(_fetch_galleryinfo, gid): gid for gid in ids[:25]}
+            for future in concurrent.futures.as_completed(future_to_id, timeout=15):
+                gid = future_to_id[future]
+                try:
+                    info = future.result()
+                except Exception:
+                    continue
+                if not info:
+                    continue
+                title = info.get("japanese_title") or info.get("title") or ""
+                lang = info.get("language") or "unknown"
+                files = info.get("files") or []
+                thumb = ""
+                if files and isinstance(files[0], dict):
+                    h = files[0].get("hash", "")
+                    if h:
+                        thumb = _hash_to_paths(h).get("thumb", "")
+                gtype = info.get("type") or "doujinshi"
+                tags_raw = info.get("tags") or []
+                cards_all.append({
+                    "source": "hitomi",
+                    "id": str(gid),
+                    "type": gtype,
+                    "title": title or f"#{gid}",
+                    "thumbnail": thumb,
+                    "url": f"https://hitomi.la/{gtype}/{_slugify(title)}-{lang}-{gid}.html",
+                    "date": info.get("date", ""),
+                    "language": lang,
+                    "language_local": LANG_LOCAL.get(lang, lang),
+                    "tags": [t.get("tag","") if isinstance(t, dict) else str(t)
+                             for t in tags_raw][:10],
+                })
+        id_order = {gid: i for i, gid in enumerate(ids[:25])}
+        cards_all.sort(key=lambda c: id_order.get(int(c["id"]), 9999))
+        cards = cards_all
+        # 検索結果が0だったことを示すフラグ
+        return {"cards": cards, "page": page, "total_pages": total_pages,
+                "fallback": "検索クエリに一致する漫画が見つからなかったため、新着を表示しています"}
     return {"cards": cards, "page": page, "total_pages": total_pages}
 
 
@@ -246,29 +303,35 @@ def get_gallery(gallery_id: str) -> dict:
                 "images": [], "url": "", "language": "unknown",
                 "language_local": "unknown"}
     title = info.get("japanese_title") or info.get("title") or f"#{gid}"
-    lang = info.get("language", "unknown")
+    lang = info.get("language", "unknown") or "unknown"
     # 全画像URLを計算
     images = []
-    for f in info.get("files", []):
-        h = f.get("hash", "")
+    for f in info.get("files") or []:
+        h = f.get("hash", "") if isinstance(f, dict) else ""
         if h:
             urls = _hash_to_paths(h)
             images.append(urls.get("webp", ""))
+    def _field_list(key, name):
+        items = info.get(key) or []
+        out = []
+        for x in items:
+            if isinstance(x, dict):
+                out.append(x.get(name, ""))
+            else:
+                out.append(str(x))
+        return [s for s in out if s]
     return {
         "source": "hitomi",
         "id": gallery_id,
-        "type": info.get("type", "doujinshi"),
+        "type": info.get("type", "doujinshi") or "doujinshi",
         "title": title,
         "images": [i for i in images if i],
-        "url": f"https://hitomi.la/{info.get('type','doujinshi')}/{_slugify(title)}-{lang}-{gid}.html",
+        "url": f"https://hitomi.la/{info.get('type','doujinshi') or 'doujinshi'}/{_slugify(title)}-{lang}-{gid}.html",
         "language": lang,
         "language_local": LANG_LOCAL.get(lang, lang),
-        "tags": [t.get("tag","") if isinstance(t, dict) else str(t)
-                 for t in info.get("tags", [])],
-        "artists": [a.get("artist","") if isinstance(a, dict) else str(a)
-                    for a in info.get("artists", [])],
-        "parodys": [p.get("parody","") if isinstance(p, dict) else str(p)
-                    for p in info.get("parodys", [])],
+        "tags": _field_list("tags", "tag"),
+        "artists": _field_list("artists", "artist"),
+        "parodys": _field_list("parodys", "parody"),
         "date": info.get("date", ""),
     }
 

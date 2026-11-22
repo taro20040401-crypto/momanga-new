@@ -77,7 +77,10 @@ def unified_search(query: str, source: str = "all", language: str = "all", page:
         results = {}
         def fetch_momonga():
             try:
-                results["momonga"] = provider_momonga.search(query, page=page)
+                if query.strip():
+                    results["momonga"] = provider_momonga.search(query, page=page)
+                else:
+                    results["momonga"] = provider_momonga.latest(page=page)
             except Exception as e:
                 if DEBUG: print(f"[momonga search error] {e}")
                 results["momonga"] = {"cards": [], "page": page, "total_pages": 0, "error": str(e)}
@@ -87,7 +90,10 @@ def unified_search(query: str, source: str = "all", language: str = "all", page:
                 lang_map = {"all": "all", "ja": "japanese", "en": "english",
                             "zh": "chinese", "ko": "korean"}
                 hl = lang_map.get(language, language)
-                results["hitomi"] = provider_hitomi.search(query, page=page, language=hl)
+                if query.strip():
+                    results["hitomi"] = provider_hitomi.search(query, page=page, language=hl)
+                else:
+                    results["hitomi"] = provider_hitomi.latest(page=page, language=hl)
             except Exception as e:
                 if DEBUG: print(f"[hitomi search error] {e}")
                 results["hitomi"] = {"cards": [], "page": page, "total_pages": 0, "error": str(e)}
@@ -109,11 +115,18 @@ def unified_search(query: str, source: str = "all", language: str = "all", page:
                 "sources": {"momonga": len(results.get("momonga", {}).get("cards", [])),
                            "hitomi": len(results.get("hitomi", {}).get("cards", []))}}
     elif source == "momonga":
-        return provider_momonga.search(query, page=page)
+        if query.strip():
+            return provider_momonga.search(query, page=page)
+        else:
+            return provider_momonga.latest(page=page)
     elif source == "hitomi":
         lang_map = {"all": "all", "ja": "japanese", "en": "english",
                     "zh": "chinese", "ko": "korean"}
-        return provider_hitomi.search(query, page=page, language=lang_map.get(language, language))
+        hl = lang_map.get(language, language)
+        if query.strip():
+            return provider_hitomi.search(query, page=page, language=hl)
+        else:
+            return provider_hitomi.latest(page=page, language=hl)
     return {"cards": [], "page": page, "total_pages": 0}
 
 

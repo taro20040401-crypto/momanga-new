@@ -238,7 +238,7 @@
   }
 
   // ===== 検索実行 =====
-  function doSearch(page) {
+  function doSearch(page, fromPopState) {
     if (page === 1) {
       state.page = 1;
       state.cards = [];
@@ -251,6 +251,13 @@
     } else {
       pageTitle.textContent = "新着";
     }
+    // History API: 検索状態をURLに反映(popstate由来の場合は不要)
+    if (!fromPopState && !modalOpenStatePushed) {
+      var newHash = buildHash();
+      if (location.hash !== newHash) {
+        history.pushState({ search: true }, "", newHash);
+      }
+    }
 
     apiSearch(page).then(function (data) {
       if (page === 1) state.cards = data.cards || [];
@@ -261,12 +268,21 @@
       renderCards();
       updateLoadMore();
       // ステータスバー
-      if (data.sources) {
+      if (data.fallback) {
+        showStatus('<span class="status-item" style="color:var(--warning)">' +
+          escapeHtml(data.fallback) + '</span>');
+      } else if (data.sources) {
         showStatus(
           '<span class="status-item"><span class="status-dot"></span> ' +
             (data.sources.momonga || 0) + '件 (momon-ga) / ' +
             (data.sources.hitomi || 0) + '件 (hitomi)</span>'
         );
+      } else if (state.source === "momonga") {
+        showStatus('<span class="status-item"><span class="status-dot"></span> ' +
+          (state.cards.length) + '件 (momon-ga)</span>');
+      } else if (state.source === "hitomi") {
+        showStatus('<span class="status-item"><span class="status-dot"></span> ' +
+          (state.cards.length) + '件 (hitomi)</span>');
       }
     }).catch(function (e) {
       state.loading = false;
@@ -279,6 +295,61 @@
   // ===== モーダル =====
   var currentGallery = null;
   var currentPage = 1;
+  // 戻るボタンでモーダルを閉じるためのHistory API対応
+  var modalOpenStatePushed = false;
+
+  function buildHash() {
+    var parts = [];
+    if (state.query) parts.push("q=" + encodeURIComponent(state.query));
+    parts.push("src=" + state.source);
+    parts.push("lang=" + state.lang);
+    parts.push("p=" + state.page);
+    return "#" + parts.join("&");
+  }
+
+  function applyHash() {
+    var h = location.hash.replace(/^#/, "");
+    if (!h) {
+      state.query = "";
+      state.source = "all";
+      state.lang = "all";
+      state.page = 1;
+      syncUIFromState();
+      doSearch(1);
+      return;
+    }
+    var params = {};
+    h.split("&").forEach(function (kv) {
+      var p = kv.split("=", 2);
+      if (p.length === 2) params[p[0]] = decodeURIComponent(p[1]);
+    });
+    var changed = false;
+    if (params.q !== undefined && params.q !== state.query) {
+      state.query = params.q; changed = true;
+    }
+    if (params.src && params.src !== state.source) {
+      state.source = params.src; changed = true;
+    }
+    if (params.lang && params.lang !== state.lang) {
+      state.lang = params.lang; changed = true;
+    }
+    var newPage = parseInt(params.p || "1", 10) || 1;
+    if (newPage !== state.page) {
+      state.page = newPage; changed = true;
+    }
+    syncUIFromState();
+    if (changed || state.cards.length === 0) doSearch(state.page);
+  }
+
+  function syncUIFromState() {
+    searchInput.value = state.query;
+    $$(".seg-btn[data-source]").forEach(function (b) {
+      b.classList.toggle("active", b.dataset.source === state.source);
+    });
+    $$(".seg-btn[data-lang]").forEach(function (b) {
+      b.classList.toggle("active", b.dataset.lang === state.lang);
+    });
+  }
 
   function openGallery(card) {
     currentPage = 1;
@@ -289,6 +360,12 @@
     bookmarkBtn.classList.toggle("active", isBookmarked(card.source, card.id));
     modal.hidden = false;
     document.body.style.overflow = "hidden";
+    // History API: モーダルを開いた履歴エントリを追加
+    if (!modalOpenStatePushed) {
+      var newState = { modal: true, source: card.source, id: card.id };
+      history.pushState(newState, "", "#gallery=" + card.source + ":" + card.id);
+      modalOpenStatePushed = true;
+    }
 
     apiGallery(card.source, card.id).then(function (g) {
       currentGallery = g;
@@ -363,9 +440,21 @@
   }
 
   function closeModal() {
-    modal.hidden = true;
-    document.body.style.overflow = "";
-    currentGallery = null;
+    if (!modal.hidden) {
+      modal.hidden = true;
+      document.body.style.overflow = "";
+      currentGallery = null;
+      // モーダルを開く時にpushした履歴エントリを戻す
+      if (modalOpenStatePushed) {
+        modalOpenStatePushed = false;
+        // pushState していた場合は戻るボタンで対応させる
+        // ただし閉じるボタン等で明示的に閉じた場合は直接history.back()
+        if (history.state && history.state.modal) {
+          history.back();
+          return;
+        }
+      }
+    }
   }
 
   function scrollToPage(n) {
@@ -485,11 +574,34 @@
   });
 
   // ===== 初期化 =====
+  // History API: popstate で状態復元
+  window.addEventListener("popstate", function (e) {
+    var st = e.state || {};
+    if (st.modal) {
+      // モーダル開状態に戻る場合はそのまま維持
+      return;
+    }
+    // モーダルが開いていれば閉じる(履歴を戻ったので)
+    if (!modal.hidden) {
+      modal.hidden = true;
+      document.body.style.overflow = "";
+      currentGallery = null;
+      modalOpenStatePushed = false;
+    }
+    // ハッシュから検索状態を復元
+    applyHash();
+  });
+
   if (store.lastQuery) {
     searchInput.value = store.lastQuery;
     state.query = store.lastQuery;
   }
-  doSearch(1);
+  // 起動時にURLハッシュがあれば適用、無ければ新着
+  if (location.hash) {
+    applyHash();
+  } else {
+    doSearch(1);
+  }
   searchForm.addEventListener("submit", function () {
     store.lastQuery = searchInput.value.trim();
     saveStore(store);
