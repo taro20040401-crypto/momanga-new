@@ -127,18 +127,37 @@ def _fetch_nozomi(path: str, page: int = 1, per_page: int = 25) -> list:
 
 
 # ===== galleryinfo =====
-def _fetch_galleryinfo(gallery_id: int) -> dict:
-    """galleries/<id>.js を取得して galleryinfo dict を返す。"""
+_gi_cache = {}  # gallery_id -> (info, expires_at)
+_GI_TTL = 600  # 10分
+
+
+def _fetch_galleryinfo(gallery_id: int, force: bool = False) -> dict:
+    """galleries/<id>.js を取得して galleryinfo dict を返す(10分キャッシュ)。"""
+    import time as _time
+    now = _time.time()
+    cached = _gi_cache.get(gallery_id)
+    if not force and cached and cached[1] > now:
+        return cached[0]
     url = f"{CDN}/galleries/{gallery_id}.js"
-    text = _fetch(url).decode("utf-8", "replace")
+    try:
+        text = _fetch(url).decode("utf-8", "replace")
+    except Exception:
+        return cached[0] if cached else {}
     # var galleryinfo = {...}; (末尾に ; がある場合もない場合も対応)
     m = re.search(r"var\s+galleryinfo\s*=\s*(\{.*\})\s*;?\s*$", text, re.S)
     if not m:
-        return {}
+        return cached[0] if cached else {}
     try:
-        return json.loads(m.group(1))
+        info = json.loads(m.group(1))
     except json.JSONDecodeError:
-        return {}
+        return cached[0] if cached else {}
+    _gi_cache[gallery_id] = (info, now + _GI_TTL)
+    # 古いエントリを掃除(簡易)
+    if len(_gi_cache) > 500:
+        for k in list(_gi_cache.keys()):
+            if _gi_cache[k][1] < now:
+                _gi_cache.pop(k, None)
+    return info
 
 
 # ===== 公開API =====

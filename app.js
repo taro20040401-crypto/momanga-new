@@ -415,6 +415,11 @@
       img.alt = "page " + page;
       img.referrerpolicy = "no-referrer";
       img.loading = "lazy";
+      // 先頭3ページは即時読み込み(初回表示を速く)
+      if (i < 3) {
+        img.src = url;
+        img.removeAttribute("data-src");
+      }
       // 読み込み失敗時のリトライ
       img.addEventListener("error", function () {
         var retry = parseInt(img.dataset.retry || "0", 10);
@@ -422,7 +427,9 @@
           img.dataset.retry = String(retry + 1);
           // キャッシュ回避のためにタイムスタンプ付与
           var sep = url.indexOf("?") >= 0 ? "&" : "?";
-          img.src = url + sep + "retry=" + (retry + 1) + "&t=" + Date.now();
+          setTimeout(function () {
+            img.src = url + sep + "retry=" + (retry + 1) + "&t=" + Date.now();
+          }, 300 * (retry + 1));  // 0.3s, 0.6s, 0.9s のバックオフ
         } else {
           // 最終的に失敗したら再読み込みボタン表示
           img.alt = "page " + page + " (読み込み失敗)";

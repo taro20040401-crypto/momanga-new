@@ -146,27 +146,23 @@ def _fetch_url(url: str, headers: dict, timeout: int = 30, retries: int = 2) -> 
     raise last_exc
 
 
-def _fetch_hitomi_image_with_fallback(file_hash: str) -> bytes:
-    """hash から両シャードを試して取得。gg.js キャッシュが古い場合のフォールバック付き。"""
-    urls = provider_hitomi._hash_to_paths(file_hash)
-    headers = {"User-Agent": UA, "Accept-Encoding": "identity",
-               "Referer": "https://hitomi.la/"}
-    # まず計算されたシャードで取得
-    primary = urls.get("webp")
-    if primary:
-        try:
-            return _fetch_url(primary, headers, timeout=30, retries=1)
-        except Exception as e:
-            if DEBUG: print(f"[hitomi img] primary failed: {primary[:80]} err={e}")
-    # フォールバック: 逆シャードを試す
-    g = int(file_hash[-1] + file_hash[-3:-1], 16)
+def _hash_to_webp_urls(file_hash: str) -> list:
+    """1つの hash から [primary_url, alt_url] の両シャードURLを返す。
+    gg.js が更新されて shard 計算がズレてもどちらかが当たる。"""
+    import re as _re
+    m = _re.match(r".*(..)(.)$", file_hash)
+    if not m:
+        return []
+    last2, last1 = m.group(1), m.group(2)
+    dir_num = int(last1 + last2, 16)
+    g = dir_num
     cur_shard = 1 if g in provider_hitomi._gg_cache["shards"] else 0
     alt_shard = 0 if cur_shard == 1 else 1
     base = provider_hitomi._gg_cache["b"]
-    dir_num = int(file_hash[-1] + file_hash[-3:-1], 16)
-    alt_url = f"https://w{1+alt_shard}.{provider_hitomi.IMG_CDN}/{base}{dir_num}/{file_hash}.webp"
-    if DEBUG: print(f"[hitomi img] trying alt: {alt_url[:80]}")
-    return _fetch_url(alt_url, headers, timeout=30, retries=2)
+    return [
+        f"https://w{1+cur_shard}.{provider_hitomi.IMG_CDN}/{base}{dir_num}/{file_hash}.webp",
+        f"https://w{1+alt_shard}.{provider_hitomi.IMG_CDN}/{base}{dir_num}/{file_hash}.webp",
+    ]
 
 
 def fetch_image(source: str, gallery_id: str, page: int) -> tuple:
@@ -183,23 +179,40 @@ def fetch_image(source: str, gallery_id: str, page: int) -> tuple:
                 continue
         raise ValueError(f"momonga image {gallery_id}/{page} not found")
     elif source == "hitomi":
-        # galleryinfo を取得 → files[page-1].hash → webp URL
+        # galleryinfo を取得(キャッシュ10分)。ここから hash を取り出して画像URL計算。
         info = provider_hitomi.get_gallery(gallery_id)
         if not info or not info.get("images"):
             raise ValueError(f"hitomi gallery {gallery_id} が見つかりません")
         # page は1-indexed
         if page < 1 or page > len(info["images"]):
             raise ValueError(f"page {page} が範囲外 (max={len(info['images'])})")
-        # 画像URLは計算済みだが、hash から再取得(フォールバック用)
+        # info は既にキャッシュされている galleryinfo から再計算されたもの。
+        # 画像URLを info["images"][page-1] から直接取得し、失敗時のみ alt シャードを試す。
+        primary_url = info["images"][page - 1]
+        headers = {"User-Agent": UA, "Accept-Encoding": "identity",
+                   "Referer": "https://hitomi.la/"}
+        # 1回目: primary
+        try:
+            return _fetch_url(primary_url, headers, timeout=20, retries=1), "image/webp"
+        except Exception as e:
+            if DEBUG: print(f"[hitomi img] primary failed: {primary_url[:80]} err={e}")
+        # 2回目: alt シャード
+        # galleryinfo の files 配列から hash を取る(get_gallery 内部でキャッシュ済)
         raw_info = provider_hitomi._fetch_galleryinfo(int(gallery_id))
         files = (raw_info or {}).get("files") or []
-        if page - 1 >= len(files):
-            raise ValueError(f"page {page} hash not found")
-        file_hash = files[page - 1].get("hash", "")
-        if not file_hash:
-            raise ValueError(f"page {page} hash empty")
-        data = _fetch_hitomi_image_with_fallback(file_hash)
-        return data, "image/webp"
+        if page - 1 < len(files):
+            file_hash = files[page - 1].get("hash", "")
+            if file_hash:
+                urls = _hash_to_webp_urls(file_hash)
+                for u in urls:
+                    if u == primary_url:
+                        continue  # 既に試したURL
+                    try:
+                        return _fetch_url(u, headers, timeout=20, retries=1), "image/webp"
+                    except Exception as e:
+                        if DEBUG: print(f"[hitomi img] alt failed: {u[:80]} err={e}")
+                        continue
+        raise ValueError(f"hitomi image {gallery_id}/{page} not found")
     raise ValueError(f"unknown source: {source}")
 
 
@@ -321,26 +334,45 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(500, {"error": str(e)})
 
         # ===== 画像プロキシ =====
+        # クエリに retry/t があってもキャッシュキーは (source, gid, page) で統一
         m = re.match(r"^/img/(\w+)/(\w+)$", path)
         if m:
             source, gid = m.group(1), m.group(2)
             page = int(qs.get("page", ["1"])[0] or "1")
+            # 画像本体キャッシュ(メモリ)。10分。成功時のみキャッシュ。
+            img_cache_key = ("img", source, gid, page)
+            cached_img = cache_get(img_cache_key)
+            if cached_img:
+                return self._send(200, cached_img[0], cached_img[1],
+                                 {"Cache-Control": "public, max-age=86400",
+                                  "X-Cache": "HIT"})
             try:
                 body, ctype = fetch_image(source, gid, page)
+                cache_set(img_cache_key, (body, ctype), ttl=600)
                 return self._send(200, body, ctype,
-                                 {"Cache-Control": "public, max-age=86400"})
+                                 {"Cache-Control": "public, max-age=86400",
+                                  "X-Cache": "MISS"})
             except Exception as e:
                 if DEBUG: print(f"[img error] {source}/{gid}/{page}: {e}")
+                # 失敗時はキャッシュしない(リトライ可能にするため)
                 return self._send(404, b"image not found", "text/plain; charset=utf-8")
 
         # ===== サムネプロキシ =====
         m = re.match(r"^/thumb/(\w+)/(\w+)$", path)
         if m:
             source, gid = m.group(1), m.group(2)
+            thumb_cache_key = ("thumb", source, gid)
+            cached_thumb = cache_get(thumb_cache_key)
+            if cached_thumb:
+                return self._send(200, cached_thumb[0], cached_thumb[1],
+                                 {"Cache-Control": "public, max-age=86400",
+                                  "X-Cache": "HIT"})
             try:
                 body, ctype = fetch_thumbnail(source, gid)
+                cache_set(thumb_cache_key, (body, ctype), ttl=600)
                 return self._send(200, body, ctype,
-                                 {"Cache-Control": "public, max-age=86400"})
+                                 {"Cache-Control": "public, max-age=86400",
+                                  "X-Cache": "MISS"})
             except Exception as e:
                 if DEBUG: print(f"[thumb error] {source}/{gid}: {e}")
                 return self._send(404, b"thumbnail not found", "text/plain; charset=utf-8")
